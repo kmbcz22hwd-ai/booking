@@ -1244,12 +1244,19 @@ window.adminCancelBooking = async (id, date) => {
   await cancelBookingDoc(id);
   S.bookingsCache[date] = list.map(x => x.id === id ? { ...x, status: "cancelled" } : x);
   if (b) {
-    await addNotification({ type: "cancel-by-admin", date, start: b.start, name: b.name, phone: b.phone, duration: b.duration });
+    await addNotification({ type: "cancel-by-admin", date, start: b.start, name: b.name, phone: b.phone, duration: b.duration, therapistName: b.therapistName });
     S.notifications = await loadNotifications();
+    const dateLabel = formatDateCN(date);
+    if (b.therapistEmail) {
+      sendEmail(S.adminAuth.emailjs, {
+        toEmail: b.therapistEmail, name: b.name, title: `預約取消 ${dateLabel} ${b.start}`,
+        message: `後台已取消這筆預約\n姓名：${b.name}\n電話：${b.phone}\n原預約時間：${dateLabel} ${b.start}`, replyEmail: b.email,
+      });
+    }
     if (b.email) {
       sendEmail(S.adminAuth.emailjs, {
         toEmail: b.email, name: b.name, title: "預約異動通知",
-        message: `${b.name} 您好，您 ${formatDateCN(date)} ${b.start} 的預約已由師傅取消，如有疑問請直接與師傅聯繫。`,
+        message: `${b.name} 您好，您 ${dateLabel} ${b.start} 的預約已由師傅取消，如有疑問請直接與師傅聯繫。`,
       });
     }
   }
