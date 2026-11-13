@@ -522,13 +522,17 @@ function durationRowHTML(current, handler) {
 
 function renderEditBooking(b) {
   const e = S.admin.edit;
-  const date = S.admin.viewDate;
   const th = S.therapists.find(t => t.id === b.therapistId);
-  const others = (S.bookingsCache[date] || []).filter(x => x.id !== b.id);
-  const slots = generateSlots(date, e.duration, (th && th.schedule) || S.schedule || DEFAULT_SCHEDULE, others, b.therapistId, S.closedDates[date], S.blocksCache[date]);
+  const sched = (th && th.schedule) || S.schedule || DEFAULT_SCHEDULE;
+  const others = (S.bookingsCache[e.date] || []).filter(x => x.id !== b.id);
+  const slots = generateSlots(e.date, e.duration, sched, others, b.therapistId, S.closedDates[e.date], S.blocksCache[e.date]);
   let h = `<div style="background:#F1ECE1;border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:10px">`;
   h += `<div style="font-weight:700;color:#2F4A3E;font-size:13.5px">修改預約（${esc(b.name)}）</div>`;
+  h += `<div class="section-label" style="margin:0">日期：${formatDateCN(e.date)}</div>`;
+  h += calendarMonthHTML(e, e.date, S.closedDates, sched, "adminEditDate", "adminEditCalNav", true);
+  h += `<div class="section-label" style="margin:0">時長</div>`;
   h += durationRowHTML(e.duration, "adminEditDuration");
+  h += `<div class="section-label" style="margin:0">開始時間</div>`;
   h += slotGridHTML(slots, e.slot, "adminEditSlot");
   if (e.error) h += `<div class="error-text">${esc(e.error)}</div>`;
   h += `<div style="display:flex;gap:8px"><button class="status-btn" onclick="adminCancelEdit()">不改了</button><button class="primary-btn" style="flex:2;margin:0" ${e.submitting || !e.slot ? "disabled" : ""} onclick="adminSaveEdit('${b.id}')">${e.submitting ? "儲存中…" : "儲存修改"}</button></div>`;
@@ -1262,43 +1266,69 @@ window.adminEditBooking = async (id) => {
   const b = (S.bookingsCache[date] || []).find(x => x.id === id);
   if (!b) return;
   await ensureBlocks(date);
-  S.admin.edit = { id, duration: b.duration, slot: { start: timeToMin(b.start) }, submitting: false, error: "" };
+  const d = new Date(date + "T00:00:00");
+  S.admin.edit = { id, date, duration: b.duration, slot: { start: timeToMin(b.start) }, submitting: false, error: "", viewYear: d.getFullYear(), viewMonth: d.getMonth() };
   render();
 };
 window.adminCancelEdit = () => { S.admin.edit = null; render(); };
+window.adminEditCalNav = (delta) => {
+  const e = S.admin.edit;
+  let m = e.viewMonth + delta, y = e.viewYear;
+  if (m < 0) { m = 11; y -= 1; } else if (m > 11) { m = 0; y += 1; }
+  const now = new Date();
+  if (y < now.getFullYear() || (y === now.getFullYear() && m < now.getMonth())) return;
+  e.viewYear = y; e.viewMonth = m;
+  render();
+};
+window.adminEditDate = async (dateStr) => {
+  const e = S.admin.edit;
+  e.date = dateStr; e.slot = null; e.error = "";
+  await Promise.all([refreshBookings(dateStr), ensureBlocks(dateStr)]);
+  render();
+};
 window.adminEditDuration = (m) => { S.admin.edit.duration = m; S.admin.edit.slot = null; S.admin.edit.error = ""; render(); };
 window.adminEditSlot = (start) => { S.admin.edit.slot = { start }; S.admin.edit.error = ""; render(); };
 window.adminSaveEdit = async (id) => {
   const e = S.admin.edit;
-  const date = S.admin.viewDate;
+  const oldDate = S.admin.viewDate;
   if (!e || !e.slot || e.submitting) return;
-  const old = (S.bookingsCache[date] || []).find(x => x.id === id);
+  const old = (S.bookingsCache[oldDate] || []).find(x => x.id === id);
   if (!old) return;
   e.submitting = true; e.error = ""; render();
   try {
-    const fresh = await refreshBookings(date);
+    const newDate = e.date;
+    const fresh = await refreshBookings(newDate);
     const th = S.therapists.find(t => t.id === old.therapistId);
     const others = fresh.filter(x => x.id !== id);
-    const slots = generateSlots(date, e.duration, (th && th.schedule) || S.schedule || DEFAULT_SCHEDULE, others, old.therapistId, S.closedDates[date], S.blocksCache[date]);
+    await ensureBlocks(newDate);
+    const slots = generateSlots(newDate, e.duration, (th && th.schedule) || S.schedule || DEFAULT_SCHEDULE, others, old.therapistId, S.closedDates[newDate], S.blocksCache[newDate]);
     const ok = slots.find(x => x.start === e.slot.start && !x.booked);
     if (!ok) { e.submitting = false; e.error = "這個時段剛被其他預約佔用或已不開放，請重新選一個。"; e.slot = null; render(); return; }
     const newStart = minToTime(e.slot.start);
     const price = (S.durations.find(d => d.minutes === e.duration) || {}).price;
-    const patch = { start: newStart, duration: e.duration };
+    const patch = { date: newDate, start: newStart, duration: e.duration };
     if (price != null) patch.price = price;
     await updateDoc(doc(db, "bookings", id), patch);
-    S.bookingsCache[date] = fresh.map(x => x.id === id ? { ...x, ...patch } : x);
-    const changed = old.start !== newStart || old.duration !== e.duration;
+    const changed = old.date !== newDate && oldDate !== newDate || old.start !== newStart || old.duration !== e.duration;
     S.admin.edit = null;
+    if (newDate !== oldDate) {
+      S.bookingsCache[oldDate] = (S.bookingsCache[oldDate] || []).filter(x => x.id !== id);
+      await refreshBookings(newDate);
+      S.admin.viewDate = newDate;
+      const nd = new Date(newDate + "T00:00:00");
+      S.admin.viewYear = nd.getFullYear(); S.admin.viewMonth = nd.getMonth();
+    } else {
+      S.bookingsCache[newDate] = fresh.map(x => x.id === id ? { ...x, ...patch } : x);
+    }
     if (changed) {
-      const dateLabel = formatDateCN(date);
+      const oldLabel = formatDateCN(oldDate), newLabel = formatDateCN(newDate);
       try {
-        await addNotification({ type: "edit-by-admin", date, start: newStart, name: old.name, phone: old.phone, duration: e.duration, therapistName: old.therapistName });
+        await addNotification({ type: "edit-by-admin", date: newDate, start: newStart, name: old.name, phone: old.phone, duration: e.duration, therapistName: old.therapistName });
         S.notifications = await loadNotifications();
       } catch (er) { console.error(er); }
-      const msgTxt = `姓名：${old.name}\n電話：${old.phone}\n原預約：${dateLabel} ${old.start}（${old.duration} 分鐘）\n新預約：${dateLabel} ${newStart}（${e.duration} 分鐘）`;
-      if (old.therapistEmail) sendEmail(S.adminAuth.emailjs, { toEmail: old.therapistEmail, name: old.name, title: `預約修改 ${dateLabel} ${newStart}`, message: `後台已修改這筆預約\n${msgTxt}`, replyEmail: old.email });
-      if (old.email) sendEmail(S.adminAuth.emailjs, { toEmail: old.email, name: old.name, title: "預約異動通知", message: `${old.name} 您好，您的預約已調整：\n原時間：${dateLabel} ${old.start}（${old.duration} 分鐘）\n新時間：${dateLabel} ${newStart}（${e.duration} 分鐘）\n如有疑問請直接與師傅聯繫。` });
+      const msgTxt = `姓名：${old.name}\n電話：${old.phone}\n原預約：${oldLabel} ${old.start}（${old.duration} 分鐘）\n新預約：${newLabel} ${newStart}（${e.duration} 分鐘）`;
+      if (old.therapistEmail) sendEmail(S.adminAuth.emailjs, { toEmail: old.therapistEmail, name: old.name, title: `預約修改 ${newLabel} ${newStart}`, message: `後台已修改這筆預約\n${msgTxt}`, replyEmail: old.email });
+      if (old.email) sendEmail(S.adminAuth.emailjs, { toEmail: old.email, name: old.name, title: "預約異動通知", message: `${old.name} 您好，您的預約已調整：\n原時間：${oldLabel} ${old.start}（${old.duration} 分鐘）\n新時間：${newLabel} ${newStart}（${e.duration} 分鐘）\n如有疑問請直接與師傅聯繫。` });
     }
   } catch (er) {
     console.error(er);
