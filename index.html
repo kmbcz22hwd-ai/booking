@@ -271,20 +271,34 @@ function generateSlots(dateStr, durationMin, schedule, bookings, therapistId, cl
   });
   return slots;
 }
+function therapistMailOf(b) {
+  const t = S.therapists.find(x => x.id === b.therapistId);
+  return (t && t.email) || b.therapistEmail || S.adminAuth.adminEmail || "";
+}
 async function sendEmail(emailjsConfig, { toEmail, name, title, message, replyEmail }) {
-  if (!emailjsConfig?.serviceId || !emailjsConfig?.templateId || !emailjsConfig?.publicKey || !toEmail) return;
-  try {
-    await fetch("https://api.emailjs.com/api/v1.0/email/send", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        service_id: emailjsConfig.serviceId, template_id: emailjsConfig.templateId, user_id: emailjsConfig.publicKey,
-        template_params: {
-          to_email: toEmail, name: name || "", title: title || "", message: message || "",
-          email: replyEmail || "", time: new Date().toLocaleString("zh-TW", { timeZone: "Asia/Taipei" }),
-        },
-      }),
-    });
-  } catch (e) { console.error("email send failed", e); }
+  if (!emailjsConfig?.serviceId || !emailjsConfig?.templateId || !emailjsConfig?.publicKey || !toEmail) return false;
+  const payload = JSON.stringify({
+    service_id: emailjsConfig.serviceId, template_id: emailjsConfig.templateId, user_id: emailjsConfig.publicKey,
+    template_params: {
+      to_email: toEmail, name: name || "", title: title || "", message: message || "",
+      email: replyEmail || "", time: new Date().toLocaleString("zh-TW", { timeZone: "Asia/Taipei" }),
+    },
+  });
+  let reason = "";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: payload, keepalive: true,
+      });
+      if (res.ok) return true;
+      reason = res.status + " " + (await res.text().catch(() => "")).slice(0, 120);
+      if (res.status >= 400 && res.status < 500) break;
+    } catch (e) { reason = "網路錯誤：" + (e && e.message ? e.message : e); }
+    if (attempt === 0) await new Promise(r => setTimeout(r, 1500));
+  }
+  console.error("email send failed", toEmail, reason);
+  try { await addNotification({ type: "email-failed", toEmail, mailTitle: title || "", reason, date: "", start: "", name: name || "", phone: "" }); } catch (e) { console.error(e); }
+  return false;
 }
 
 // ====== Firestore 存取 ======
@@ -715,7 +729,7 @@ function renderAdminPanel() {
     html += `<div class="empty-box">目前沒有通知。</div>`;
   } else {
     html += `<div style="margin-bottom:20px">` + S.notifications.slice(0, 8).map(n =>
-      `<div class="notif-row ${n.read ? "" : "unread"}">🔔 ${n.type === "new" ? "新預約" : n.type === "edit-by-admin" ? "已修改" : "已取消"}：${formatDateCN(n.date)} ${n.start} · ${esc(n.name)}（${esc(n.phone)}）${n.therapistName ? " · " + esc(n.therapistName) : ""}</div>`
+      n.type === "email-failed" ? `<div class="notif-row unread">⚠️ 郵件沒寄出：${esc(n.toEmail)}（${esc(n.mailTitle)}）<br><span style="font-size:11.5px;opacity:.75">${esc(n.reason)}</span></div>` : `<div class="notif-row ${n.read ? "" : "unread"}">🔔 ${n.type === "new" ? "新預約" : n.type === "edit-by-admin" ? "已修改" : "已取消"}：${formatDateCN(n.date)} ${n.start} · ${esc(n.name)}（${esc(n.phone)}）${n.therapistName ? " · " + esc(n.therapistName) : ""}</div>`
     ).join("") + `</div>`;
   }
   html += `<div class="divider"></div>`;
@@ -972,9 +986,9 @@ window.bookSubmit = async () => {
   await addNotification({ type: "new", date: record.date, start: record.start, name, phone, duration: b.duration, therapistName: record.therapistName });
   S.notifications = await loadNotifications();
   const dateLabel = formatDateCN(b.selectedDate);
-  if (record.therapistEmail) {
+  if (therapistMailOf(record)) {
     sendEmail(S.adminAuth.emailjs, {
-      toEmail: record.therapistEmail, name, title: `新預約 ${dateLabel} ${record.start}`,
+      toEmail: therapistMailOf(record), name, title: `新預約 ${dateLabel} ${record.start}`,
       message: `姓名：${name}\n電話：${phone}\n日期時間：${dateLabel} ${record.start}（${b.duration} 分鐘）\n備註：${note || "無"}`,
       replyEmail: email,
     });
@@ -1005,9 +1019,9 @@ window.manageCancel = async (id, date) => {
   await addNotification({ type: "cancel", date: b.date, start: b.start, name: b.name, phone: b.phone, duration: b.duration, therapistName: b.therapistName });
   S.notifications = await loadNotifications();
   const dateLabel = formatDateCN(b.date);
-  if (b.therapistEmail) {
+  if (therapistMailOf(b)) {
     sendEmail(S.adminAuth.emailjs, {
-      toEmail: b.therapistEmail, name: b.name, title: `預約取消 ${dateLabel} ${b.start}`,
+      toEmail: therapistMailOf(b), name: b.name, title: `預約取消 ${dateLabel} ${b.start}`,
       message: `客人取消了預約\n姓名：${b.name}\n電話：${b.phone}\n原預約時間：${dateLabel} ${b.start}`, replyEmail: b.email,
     });
   }
@@ -1327,7 +1341,7 @@ window.adminSaveEdit = async (id) => {
         S.notifications = await loadNotifications();
       } catch (er) { console.error(er); }
       const msgTxt = `姓名：${old.name}\n電話：${old.phone}\n原預約：${oldLabel} ${old.start}（${old.duration} 分鐘）\n新預約：${newLabel} ${newStart}（${e.duration} 分鐘）`;
-      if (old.therapistEmail) sendEmail(S.adminAuth.emailjs, { toEmail: old.therapistEmail, name: old.name, title: `預約修改 ${newLabel} ${newStart}`, message: `後台已修改這筆預約\n${msgTxt}`, replyEmail: old.email });
+      if (therapistMailOf(old)) sendEmail(S.adminAuth.emailjs, { toEmail: therapistMailOf(old), name: old.name, title: `預約修改 ${newLabel} ${newStart}`, message: `後台已修改這筆預約\n${msgTxt}`, replyEmail: old.email });
       if (old.email) sendEmail(S.adminAuth.emailjs, { toEmail: old.email, name: old.name, title: "預約異動通知", message: `${old.name} 您好，您的預約已調整：\n原時間：${oldLabel} ${old.start}（${old.duration} 分鐘）\n新時間：${newLabel} ${newStart}（${e.duration} 分鐘）\n如有疑問請直接與師傅聯繫。` });
     }
   } catch (er) {
@@ -1345,9 +1359,9 @@ window.adminCancelBooking = async (id, date) => {
     await addNotification({ type: "cancel-by-admin", date, start: b.start, name: b.name, phone: b.phone, duration: b.duration, therapistName: b.therapistName });
     S.notifications = await loadNotifications();
     const dateLabel = formatDateCN(date);
-    if (b.therapistEmail) {
+    if (therapistMailOf(b)) {
       sendEmail(S.adminAuth.emailjs, {
-        toEmail: b.therapistEmail, name: b.name, title: `預約取消 ${dateLabel} ${b.start}`,
+        toEmail: therapistMailOf(b), name: b.name, title: `預約取消 ${dateLabel} ${b.start}`,
         message: `後台已取消這筆預約\n姓名：${b.name}\n電話：${b.phone}\n原預約時間：${dateLabel} ${b.start}`, replyEmail: b.email,
       });
     }
