@@ -820,7 +820,7 @@ function renderAdminPanel() {
   if (a.priceTip) html += `<div class="saved-tip">${esc(a.priceTip)}</div>`;
   html += `<div class="divider"></div>`;
   html += `<div class="section-label">優惠券設定</div>`;
-  html += `<p class="hint-text">可以自己建立生日券、節日券，折抵金額依時長分別設定。建立後按「複製連結文案」，貼到官方 LINE 發給客人。客人預約時會自動帶入優惠碼，到店您核對證件後，按預約上的「核對證件並折抵」才算數。</p>`;
+  html += `<p class="hint-text">可以自己建立生日券、節日券，折抵金額依時長分別設定。建立後系統會自動產生優惠碼，不用自己想。按「複製連結文案」，貼到官方 LINE 發給客人，優惠碼已經包在連結裡。客人預約時會自動帶入優惠碼，到店您核對證件後，按預約上的「核對證件並折抵」才算數。</p>`;
   S.coupons.forEach(c => {
     html += `<div class="card" style="text-align:left;margin-bottom:10px">
       <div style="font-weight:700;color:#203329">${c.birthday ? "🎂" : "🎟️"} ${esc(c.title)} <span style="font-size:12px;color:#8B8B80">${esc(c.code)}${c.active ? "" : "（已停用）"}</span></div>
@@ -835,7 +835,6 @@ function renderAdminPanel() {
   html += `<div class="card" style="text-align:left">
     <div class="section-label" style="margin-top:0">新增優惠券</div>
     <div class="form-field">📛 <input id="cp-title" placeholder="名稱，例如：生日優惠券、春節優惠券" /></div>
-    <div class="form-field">🔑 <input id="cp-code" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="優惠碼（英數字，例如 BDAY）" /></div>
     <div class="form-field">🎁 <select id="cp-kind" style="flex:1;border:none;background:transparent;font-size:15px"><option value="birthday">生日券（限生日當月、每年一次）</option><option value="festival">節日券（每人限用一次）</option></select></div>
     ${S.durations.map(d => `<div class="form-field">${d.minutes} 分鐘折 $<input id="cp-amt-${d.minutes}" type="number" inputmode="numeric" value="${d.minutes === 60 ? 50 : d.minutes === 90 ? 100 : ""}" /></div>`).join("")}
     <div class="form-field">📅 <input id="cp-from" type="date" /> ~ <input id="cp-to" type="date" /></div>
@@ -1512,11 +1511,12 @@ function couponTipFlash(msg) {
 }
 window.adminAddCoupon = async () => {
   const title = document.getElementById("cp-title").value.trim();
-  const code = document.getElementById("cp-code").value.trim().toUpperCase();
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code = "";
+  do { code = Array.from({ length: 6 }, () => chars[Math.floor(Math.random() * chars.length)]).join(""); }
+  while (S.coupons.some(c => String(c.code).toUpperCase() === code));
   const kind = document.getElementById("cp-kind").value;
-  if (!title || !code) return couponTipFlash("請填寫名稱與優惠碼");
-  if (!/^[A-Z0-9_-]{2,20}$/.test(code)) return couponTipFlash("優惠碼請用英文或數字，2 到 20 個字");
-  if (S.coupons.some(c => String(c.code).toUpperCase() === code)) return couponTipFlash("這個優惠碼已經有了，請換一個");
+  if (!title) return couponTipFlash("請填寫優惠券名稱");
   const amounts = {};
   S.durations.forEach(d => { const v = parseInt(document.getElementById("cp-amt-" + d.minutes)?.value, 10); if (v > 0) amounts[d.minutes] = v; });
   if (!Object.keys(amounts).length) return couponTipFlash("請至少設定一個時長的折抵金額");
@@ -1528,7 +1528,7 @@ window.adminAddCoupon = async () => {
   S.coupons.push(c);
   const ok = await setConfig("coupons", { list: S.coupons });
   if (!ok) { S.coupons.pop(); return couponTipFlash("儲存失敗，請檢查網路連線後再試一次"); }
-  couponTipFlash("已新增優惠券，按「複製連結文案」就能發給客人");
+  couponTipFlash("已新增，優惠碼 " + code + "（已自動產生），按「複製連結文案」就能發給客人");
 };
 window.adminToggleCoupon = async (id) => {
   const c = S.coupons.find(x => x.id === id);
