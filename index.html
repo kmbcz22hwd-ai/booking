@@ -369,8 +369,55 @@ async function markAllNotificationsRead(list) {
 }
 async function upsertCustomer(rec) {
   if (!rec.phone) return;
-  try { await setDoc(doc(db, "customers", rec.phone), { name: rec.name, phone: rec.phone, email: rec.email || "", birthday: rec.birthday || "", lastBooked: Date.now() }, { merge: true }); }
-  catch (e) { console.error(e); }
+  try {
+    const data = { name: rec.name, phone: rec.phone, lastBooked: Date.now() };
+    if (rec.email) data.email = rec.email;
+    if (rec.birthday) {
+      const snap = await getDoc(doc(db, "customers", rec.phone));
+      if (!(snap.exists() && snap.data().birthdayLocked)) data.birthday = rec.birthday;
+    }
+    await setDoc(doc(db, "customers", rec.phone), data, { merge: true });
+  } catch (e) { console.error(e); }
+}
+async function getCustomerDoc(phone) {
+  try { const snap = await getDoc(doc(db, "customers", phone)); return snap.exists() ? snap.data() : null; }
+  catch (e) { console.error(e); return null; }
+}
+async function countCouponUse(couponId) {
+  try {
+    const snap = await getDocs(query(collection(db, "bookings"), where("couponId", "==", couponId), where("status", "==", "confirmed")));
+    return snap.docs.filter(d => d.data().couponStatus !== "void").length;
+  } catch (e) { console.error(e); return 0; }
+}
+function couponAmountsText(c) {
+  return S.durations.filter(d => Number((c.amounts || {})[d.minutes]) > 0).map(d => d.minutes + " 分鐘折 $" + c.amounts[d.minutes]).join("、");
+}
+function couponLink(c) { return location.origin + location.pathname + "?coupon=" + encodeURIComponent(c.code); }
+async function validateCoupon(code, { phone, birthday, dateStr, duration }) {
+  const c = S.coupons.find(x => String(x.code).toUpperCase() === String(code).toUpperCase());
+  if (!c || !c.active) return { ok: false, msg: "找不到這個優惠碼，或優惠已停用" };
+  if (c.validFrom && dateStr < c.validFrom) return { ok: false, msg: "這個優惠要預約 " + c.validFrom + " 之後的日期才能使用" };
+  if (c.validTo && dateStr > c.validTo) return { ok: false, msg: "這個優惠只能用在 " + c.validTo + " 以前的預約" };
+  const amount = Number((c.amounts || {})[duration] || 0);
+  if (!amount) return { ok: false, msg: "這個優惠不適用於您選的時長" };
+  let bday = "";
+  if (c.birthday) {
+    const cust = await getCustomerDoc(phone);
+    bday = (cust && cust.birthdayLocked) ? cust.birthday : (birthday || (cust && cust.birthday) || "");
+    if (!bday) return { ok: false, msg: "這是生日優惠，請先在上方填寫您的生日" };
+    if (bday.slice(5, 7) !== dateStr.slice(5, 7)) return { ok: false, msg: "生日優惠僅限生日當月使用，預約日期需在您的生日月份" };
+  }
+  const mine = await searchBookingsByPhone(phone);
+  if (c.birthday) {
+    if (mine.some(b => b.couponBirthday && b.couponStatus !== "void" && String(b.date).slice(0, 4) === dateStr.slice(0, 4))) return { ok: false, msg: "您今年已經使用過生日優惠囉" };
+  } else if (mine.some(b => b.couponId === c.id && b.couponStatus !== "void")) {
+    return { ok: false, msg: "這張優惠您已經使用過囉" };
+  }
+  if (c.maxTotal) {
+    const used = await countCouponUse(c.id);
+    if (used >= c.maxTotal) return { ok: false, msg: "這張優惠已被領完了" };
+  }
+  return { ok: true, c, amount, birthday: bday };
 }
 async function loadDirectory() {
   try {
@@ -410,7 +457,8 @@ const S = {
   durations: [{ minutes: 60, price: 1200 }, { minutes: 90, price: 1500 }],
   bookingsCache: {},
   blocksCache: {},
-  book: { therapistId: null, selectedDate: null, duration: 60, selectedSlot: null, success: null, error: "", submitting: false },
+  coupons: [],
+  book: { therapistId: null, selectedDate: null, duration: 60, selectedSlot: null, success: null, error: "", submitting: false, couponCode: "", draft: null },
   manage: { results: null, searching: false },
   admin: {
     pwError: "", scheduleDraft: null, savedTip: "", viewDate: toDateStr(new Date()),
@@ -421,7 +469,7 @@ const S = {
     studioNameDraft: "", studioSubtitleDraft: "", studioTip: "",
     scheduleTherapistId: null, editingTherapistId: null,
     block: { therapistId: null, date: null, start: "", end: "", tip: "" },
-    edit: null,
+    edit: null, couponTip: "",
   },
 };
 
@@ -446,6 +494,9 @@ async function init() {
   S.therapists = await loadTherapists();
   const durCfg = await getConfig("durations", { list: S.durations });
   if (durCfg.list && durCfg.list.length > 0) S.durations = durCfg.list;
+  const cpCfg = await getConfig("coupons", { list: [] });
+  S.coupons = cpCfg.list || [];
+  try { const cp = new URLSearchParams(location.search).get("coupon"); if (cp) S.book.couponCode = cp.trim().toUpperCase(); } catch (e) {}
   if (S.therapists.length === 0) {
     const id = await addTherapistDoc({ name: "師傅 吳", email: S.adminAuth.adminEmail || "", schedule: S.schedule });
     S.therapists = [{ id, name: "師傅 吳", email: S.adminAuth.adminEmail || "", schedule: S.schedule }];
@@ -534,6 +585,16 @@ function durationRowHTML(current, handler) {
   ).join("")}</div>`;
 }
 
+function couponRowHTML(b, date) {
+  if (!b.couponId) return "";
+  const tag = b.couponBirthday ? "🎂" : "🎟️";
+  if (b.couponStatus === "redeemed") return `<div style="font-size:12.5px;color:#2F4A3E;font-weight:700">${tag} ${esc(b.couponTitle)}：已核對並折抵 $${b.discount}（原價 $${b.originalPrice}）</div>`;
+  if (b.couponStatus === "void") return `<div style="font-size:12.5px;color:#8B8B80">${tag} ${esc(b.couponTitle)}：優惠已取消</div>`;
+  return `<div style="background:#FBF1DD;border-radius:10px;padding:8px 10px;display:flex;flex-direction:column;gap:6px">
+    <div style="font-size:12.5px;font-weight:700;color:#A85C32">${tag} ${esc(b.couponTitle)}：待核對證件，可折抵 $${b.couponAmount}</div>
+    <div style="display:flex;gap:8px"><button class="primary-btn" style="margin:0;padding:8px;flex:2" onclick="adminRedeemCoupon('${b.id}','${date}')">核對證件並折抵</button><button class="status-btn" onclick="adminVoidCoupon('${b.id}','${date}')">取消優惠</button></div>
+  </div>`;
+}
 function renderEditBooking(b) {
   const e = S.admin.edit;
   const th = S.therapists.find(t => t.id === b.therapistId);
@@ -586,6 +647,7 @@ function renderBookTab() {
         <div class="success-row"><span class="lbl">時間</span><span class="val">${r.start}（${r.duration} 分鐘）</span></div>
         <div class="success-row"><span class="lbl">師傅</span><span class="val">${esc(r.therapistName || "")}</span></div>
         <div class="success-row"><span class="lbl">金額</span><span class="val">${r.price != null ? "$" + r.price : "-"}</span></div>
+        ${r.couponTitle ? `<div class="success-row"><span class="lbl">優惠券</span><span class="val">${esc(r.couponTitle)}（-$${r.couponAmount}，到店核對證件後折抵）</span></div>` : ""}
         <div class="success-row"><span class="lbl">姓名</span><span class="val">${esc(r.name)}</span></div>
         <div class="success-row"><span class="lbl">電話</span><span class="val">${esc(r.phone)}</span></div>
       </div>
@@ -597,6 +659,12 @@ function renderBookTab() {
   }
   let html = `<div class="body-pad">`;
   let stepNum = 1;
+  if (b.couponCode) {
+    const bc = S.coupons.find(c => c.active && String(c.code).toUpperCase() === b.couponCode);
+    html += bc
+      ? `<div class="card" style="text-align:left;background:#FBF1DD;margin-bottom:14px"><div style="font-weight:700;color:#A85C32">${bc.birthday ? "🎂" : "🎟️"} ${esc(bc.title)}（已帶入優惠碼）</div><div class="hint-text" style="margin:4px 0 0">${esc(couponAmountsText(bc))}。${bc.birthday ? "請在填寫資料時填入生日，限生日當月預約使用。" : ""}到店出示證件核對後折抵。</div></div>`
+      : `<div class="error-text" style="margin-bottom:10px">優惠碼 ${esc(b.couponCode)} 無法使用（已停用或不存在）</div>`;
+  }
   html += `<div class="section-label">${stepNum}. 選擇師傅</div>`;
   html += `<div class="duration-row">` + S.therapists.map(t =>
     `<button class="duration-btn ${b.therapistId === t.id ? "active" : ""}" onclick="bookSelectTherapist('${t.id}')">${esc(t.name)}</button>`
@@ -613,13 +681,16 @@ function renderBookTab() {
     const slots = generateSlots(b.selectedDate, b.duration, (S.therapists.find(t => t.id === b.therapistId)?.schedule) || DEFAULT_SCHEDULE, bookings, b.therapistId, S.closedDates[b.selectedDate], S.blocksCache[b.selectedDate]);
     html += slotGridHTML(slots, b.selectedSlot, "bookSelectSlot");
     if (b.selectedSlot) {
+      const dr = b.draft || {};
       html += `<div class="card" style="text-align:left">
         <div class="section-label" style="margin-top:0">${stepNum}. 填寫資料</div>
-        <div class="form-field">👤 <input id="bk-name" required placeholder="姓名（必填）" /></div>
-        <div class="form-field">📞 <input id="bk-phone" required autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="手機號碼（必填，09xxxxxxxx）" /></div>
-        <div class="form-field">✉️ <input id="bk-email" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Email（選填，填寫可收到預約確認信）" /></div>
-        <div class="form-field">🎂 <input id="bk-birthday" type="date" placeholder="生日（選填）" /></div>
-        <div class="form-field">📝 <input id="bk-note" placeholder="備註（選填，如：舊傷部位）" /></div>
+        <div class="form-field">👤 <input id="bk-name" required placeholder="姓名（必填）" value="${esc(dr.name || "")}" /></div>
+        <div class="form-field">📞 <input id="bk-phone" required autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="手機號碼（必填，09xxxxxxxx）" value="${esc(dr.phone || "")}" /></div>
+        <div class="form-field">✉️ <input id="bk-email" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Email（選填，填寫可收到預約確認信）" value="${esc(dr.email || "")}" /></div>
+        <div class="form-field">🎂 <input id="bk-birthday" type="date" value="${esc(dr.birthday || "")}" /></div>
+        <div class="hint-text" style="margin:-4px 0 8px">生日選填；使用生日優惠券時必填。</div>
+        <div class="form-field">🎟️ <input id="bk-coupon" autocapitalize="characters" autocorrect="off" spellcheck="false" placeholder="優惠碼（選填）" value="${esc(dr.coupon != null ? dr.coupon : (b.couponCode || ""))}" /></div>
+        <div class="form-field">📝 <input id="bk-note" placeholder="備註（選填，如：舊傷部位）" value="${esc(dr.note || "")}" /></div>
         ${b.error ? `<div class="error-text">${esc(b.error)}</div>` : ""}
         <button class="primary-btn" ${b.submitting ? "disabled" : ""} onclick="bookSubmit()">
           ${b.submitting ? "送出中…" : `確認預約 ${formatDateCN(b.selectedDate)} ${minToTime(b.selectedSlot.start)}`}
@@ -686,6 +757,8 @@ function renderQuickBook() {
         html += slotGridHTML(slots, a.qb.slot, "adminQbSelectSlot");
         if (a.qb.slot) {
           html += `<div class="form-field">📝 <input id="qb-note" placeholder="備註（選填）" /></div>`;
+          const qbCoupons = S.coupons.filter(c => c.active && Number((c.amounts || {})[a.qb.duration]) > 0);
+          if (qbCoupons.length) html += `<div class="form-field">🎟️ <select id="qb-coupon" style="flex:1;border:none;background:transparent;font-size:15px"><option value="">不使用優惠券</option>${qbCoupons.map(c => `<option value="${c.id}">${esc(c.title)}（折 $${c.amounts[a.qb.duration]}）</option>`).join("")}</select></div>`;
           if (a.qb.error) html += `<div class="error-text">${esc(a.qb.error)}</div>`;
           html += `<button class="primary-btn" ${a.qb.submitting ? "disabled" : ""} onclick="adminQbSubmit()">${a.qb.submitting ? "送出中…" : "確認幫客人預約"}</button>`;
         }
@@ -746,6 +819,32 @@ function renderAdminPanel() {
   html += `<button class="primary-btn" style="margin-top:8px" onclick="adminSaveDurations()">儲存時長與價格</button>`;
   if (a.priceTip) html += `<div class="saved-tip">${esc(a.priceTip)}</div>`;
   html += `<div class="divider"></div>`;
+  html += `<div class="section-label">優惠券設定</div>`;
+  html += `<p class="hint-text">可以自己建立生日券、節日券，折抵金額依時長分別設定。建立後按「複製連結文案」，貼到官方 LINE 發給客人。客人預約時會自動帶入優惠碼，到店您核對證件後，按預約上的「核對證件並折抵」才算數。</p>`;
+  S.coupons.forEach(c => {
+    html += `<div class="card" style="text-align:left;margin-bottom:10px">
+      <div style="font-weight:700;color:#203329">${c.birthday ? "🎂" : "🎟️"} ${esc(c.title)} <span style="font-size:12px;color:#8B8B80">${esc(c.code)}${c.active ? "" : "（已停用）"}</span></div>
+      <div class="hint-text" style="margin:4px 0 8px">${esc(couponAmountsText(c) || "未設定金額")}${c.birthday ? " · 限生日當月，每年限一次" : " · 每人限用一次"}${c.validFrom || c.validTo ? " · " + esc(c.validFrom || "…") + " ~ " + esc(c.validTo || "…") : ""}${c.maxTotal ? " · 限量 " + c.maxTotal + " 張" : ""}</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="primary-btn" style="flex:2;margin:0;padding:10px" onclick="adminCopyCoupon('${c.id}')">複製連結文案</button>
+        <button class="status-btn" onclick="adminToggleCoupon('${c.id}')">${c.active ? "停用" : "啟用"}</button>
+        <button class="danger-btn" onclick="adminDeleteCoupon('${c.id}')">刪除</button>
+      </div>
+    </div>`;
+  });
+  html += `<div class="card" style="text-align:left">
+    <div class="section-label" style="margin-top:0">新增優惠券</div>
+    <div class="form-field">📛 <input id="cp-title" placeholder="名稱，例如：生日優惠券、春節優惠券" /></div>
+    <div class="form-field">🔑 <input id="cp-code" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="優惠碼（英數字，例如 BDAY）" /></div>
+    <div class="form-field">🎁 <select id="cp-kind" style="flex:1;border:none;background:transparent;font-size:15px"><option value="birthday">生日券（限生日當月、每年一次）</option><option value="festival">節日券（每人限用一次）</option></select></div>
+    ${S.durations.map(d => `<div class="form-field">${d.minutes} 分鐘折 $<input id="cp-amt-${d.minutes}" type="number" inputmode="numeric" value="${d.minutes === 60 ? 50 : d.minutes === 90 ? 100 : ""}" /></div>`).join("")}
+    <div class="form-field">📅 <input id="cp-from" type="date" /> ~ <input id="cp-to" type="date" /></div>
+    <div class="hint-text" style="margin:0 0 8px">有效期間選填，依客人「預約的日期」判斷；不填就是不限。</div>
+    <div class="form-field">🔢 <input id="cp-max" type="number" inputmode="numeric" placeholder="限量張數（選填，空白為不限）" /></div>
+    <button class="primary-btn" onclick="adminAddCoupon()">新增優惠券</button>
+  </div>`;
+  if (a.couponTip) html += `<div class="saved-tip">${esc(a.couponTip)}</div>`;
+  html += `<div class="divider"></div>`;
   html += `<div class="section-label">師傅管理</div>`;
   html += `<p class="hint-text">新增師傅後，客人預約時可以選擇師傅；每位師傅的預約通知會分別寄到各自的信箱。</p>`;
   S.therapists.forEach(t => {
@@ -799,9 +898,11 @@ function renderAdminPanel() {
     html += `<div class="empty-box">${formatDateCN(a.viewDate)} 目前沒有預約。</div>`;
   } else {
     viewBookings.forEach(b => {
+      const custInfo = S.directory.find(c => c.phone === b.phone) || {};
+      const extraInfo = [custInfo.birthday ? "🎂 " + custInfo.birthday : "", b.email ? "✉️ " + b.email : ""].filter(Boolean).join(" · ");
       html += `<div class="booking-row" style="flex-direction:column;align-items:stretch;gap:8px">
         <div style="display:flex;justify-content:space-between;align-items:center">
-          <div><div class="d">${b.start} · ${b.duration} 分鐘${b.price != null ? " · $" + b.price : ""}${b.therapistName ? " · " + esc(b.therapistName) : ""}</div><div class="t">${esc(b.name)} · ${esc(b.phone)}${b.note ? " · " + esc(b.note) : ""}</div></div>
+          <div><div class="d">${b.start} · ${b.duration} 分鐘${b.price != null ? " · $" + b.price : ""}${b.therapistName ? " · " + esc(b.therapistName) : ""}</div><div class="t">${esc(b.name)} · ${esc(b.phone)}${b.note ? " · " + esc(b.note) : ""}</div>${extraInfo ? `<div class="t" style="opacity:.8">${esc(extraInfo)}</div>` : ""}</div>
           <div style="display:flex;gap:6px">
             <a href="${googleCalendarLink({ ...b, date: a.viewDate })}" target="_blank" style="text-decoration:none;background:#F1ECE1;color:#2F4A3E;border-radius:8px;padding:8px 10px;font-size:12.5px;font-weight:700">📅</a>
             <button class="status-btn" style="flex:none;padding:8px 12px" onclick="adminEditBooking('${b.id}')">修改</button>
@@ -812,6 +913,7 @@ function renderAdminPanel() {
           <button class="status-btn ${b.arrived ? "on-arrived" : ""}" onclick="adminToggleStatus('${b.id}','${a.viewDate}','arrived')">${b.arrived ? "✓ 已到店" : "未到店"}</button>
           <button class="status-btn ${b.paid ? "on-paid" : ""}" onclick="adminToggleStatus('${b.id}','${a.viewDate}','paid')">${b.paid ? "✓ 已付款" : "未付款"}</button>
         </div>
+        ${couponRowHTML(b, a.viewDate)}
         ${a.edit && a.edit.id === b.id ? renderEditBooking(b) : ""}
       </div>`;
     });
@@ -950,7 +1052,7 @@ window.bookSelectDuration = (v) => { S.book.duration = v; S.book.selectedSlot = 
 window.bookSelectSlot = (start) => { S.book.selectedSlot = { start, end: start + S.book.duration }; render(); };
 window.bookReset = () => {
   const keepTherapist = S.therapists.length === 1 ? S.therapists[0].id : null;
-  S.book = { therapistId: keepTherapist, selectedDate: null, duration: 60, selectedSlot: null, success: null, error: "", submitting: false };
+  S.book = { therapistId: keepTherapist, selectedDate: null, duration: 60, selectedSlot: null, success: null, error: "", submitting: false, couponCode: "", draft: null };
   render();
 };
 window.bookSubmit = async () => {
@@ -959,11 +1061,18 @@ window.bookSubmit = async () => {
   const email = document.getElementById("bk-email").value.trim();
   const birthday = document.getElementById("bk-birthday").value;
   const note = document.getElementById("bk-note").value.trim();
+  const couponCode = (document.getElementById("bk-coupon")?.value || "").trim().toUpperCase();
   const b = S.book;
+  b.draft = { name, phone, email, birthday, note, coupon: couponCode };
   b.error = "";
   if (!name || !phone) { b.error = "請填寫姓名與手機號碼"; render(); return; }
   if (!/^09\d{8}$/.test(phone)) { b.error = "手機號碼格式不正確，請輸入 09 開頭的 10 碼手機號碼"; render(); return; }
   b.submitting = true; render();
+  let couponRes = null;
+  if (couponCode) {
+    couponRes = await validateCoupon(couponCode, { phone, birthday, dateStr: b.selectedDate, duration: b.duration });
+    if (!couponRes.ok) { b.error = couponRes.msg; b.submitting = false; render(); return; }
+  }
   const latest = await refreshBookings(b.selectedDate);
   const conflict = latest.filter(x => x.status === "confirmed" && x.therapistId === b.therapistId).some(x => {
     const bs = timeToMin(x.start), be = bs + x.duration;
@@ -978,6 +1087,7 @@ window.bookSubmit = async () => {
     date: b.selectedDate, start: minToTime(b.selectedSlot.start), duration: b.duration, price: S.durations.find(d => d.minutes === b.duration)?.price ?? null,
     name, phone, email, note, status: "confirmed", createdAt: Date.now(), arrived: false, paid: false,
     therapistId: b.therapistId, therapistName: therapist.name || "", therapistEmail: therapist.email || "",
+    ...(couponRes ? { couponId: couponRes.c.id, couponCode: couponRes.c.code, couponTitle: couponRes.c.title, couponBirthday: !!couponRes.c.birthday, couponAmount: couponRes.amount, couponStatus: "pending" } : {}),
   };
   const id = await addBooking(record);
   S.bookingsCache[b.selectedDate] = [...latest, { id, ...record }];
@@ -989,7 +1099,7 @@ window.bookSubmit = async () => {
   if (therapistMailOf(record)) {
     sendEmail(S.adminAuth.emailjs, {
       toEmail: therapistMailOf(record), name, title: `新預約 ${dateLabel} ${record.start}`,
-      message: `姓名：${name}\n電話：${phone}\n日期時間：${dateLabel} ${record.start}（${b.duration} 分鐘）\n備註：${note || "無"}`,
+      message: `姓名：${name}\n電話：${phone}\n日期時間：${dateLabel} ${record.start}（${b.duration} 分鐘）\n備註：${note || "無"}${couponRes ? "\n優惠券：" + couponRes.c.title + "（待核對證件，可折抵 $" + couponRes.amount + (couponRes.c.birthday ? "；客人填寫生日：" + (couponRes.birthday || "無") : "") + "）" : ""}`,
       replyEmail: email,
     });
   }
@@ -999,7 +1109,7 @@ window.bookSubmit = async () => {
       message: `${name} 您好，您的預約已成立。\n師傅：${record.therapistName}\n日期時間：${dateLabel} ${record.start}（${b.duration} 分鐘）\n如需取消，請至預約系統的「查詢/取消」頁面用手機號碼查詢。`,
     });
   }
-  b.success = { ...record }; b.submitting = false;
+  b.success = { ...record }; b.submitting = false; b.draft = null;
   render();
 };
 
@@ -1090,6 +1200,7 @@ window.adminQbSelectDuration = (v) => { S.admin.qb.duration = v; S.admin.qb.slot
 window.adminQbSelectSlot = (start) => { S.admin.qb.slot = { start }; render(); };
 window.adminQbSubmit = async () => {
   const note = document.getElementById("qb-note")?.value.trim() || "";
+  const qbCp = S.coupons.find(c => c.id === (document.getElementById("qb-coupon")?.value || ""));
   const qb = S.admin.qb;
   const cust = S.admin.pickedCustomer;
   qb.error = "";
@@ -1108,6 +1219,7 @@ window.adminQbSubmit = async () => {
     date: qb.date, start: minToTime(qb.slot.start), duration: qb.duration, price: S.durations.find(d => d.minutes === qb.duration)?.price ?? null,
     name: cust.name, phone: cust.phone, email: cust.email || "", note, status: "confirmed", createdAt: Date.now(), arrived: false, paid: false,
     therapistId: qb.therapistId, therapistName: therapist.name || "", therapistEmail: therapist.email || "",
+    ...(qbCp ? { couponId: qbCp.id, couponCode: qbCp.code, couponTitle: qbCp.title, couponBirthday: !!qbCp.birthday, couponAmount: Number((qbCp.amounts || {})[qb.duration] || 0), couponStatus: "pending" } : {}),
   };
   const id = await addBooking(record);
   S.bookingsCache[qb.date] = [...latest, { id, ...record }];
@@ -1322,6 +1434,15 @@ window.adminSaveEdit = async (id) => {
     const price = (S.durations.find(d => d.minutes === e.duration) || {}).price;
     const patch = { date: newDate, start: newStart, duration: e.duration };
     if (price != null) patch.price = price;
+    if (old.couponId && old.couponStatus !== "void") {
+      const cp = S.coupons.find(x => x.id === old.couponId);
+      const amt = cp ? Number((cp.amounts || {})[e.duration] || 0) : Number(old.couponAmount || 0);
+      patch.couponAmount = amt;
+      if (price != null) {
+        patch.originalPrice = price;
+        if (old.couponStatus === "redeemed") { patch.discount = Math.min(amt, price); patch.price = price - patch.discount; }
+      }
+    }
     await updateDoc(doc(db, "bookings", id), patch);
     const changed = old.date !== newDate && oldDate !== newDate || old.start !== newStart || old.duration !== e.duration;
     S.admin.edit = null;
@@ -1349,6 +1470,101 @@ window.adminSaveEdit = async (id) => {
     e.submitting = false; e.error = "儲存失敗，請檢查網路後再試一次。";
   }
   render();
+};
+window.adminRedeemCoupon = async (id, date) => {
+  const list = S.bookingsCache[date] || [];
+  const b = list.find(x => x.id === id);
+  if (!b || !b.couponId) return;
+  const cust = S.directory.find(c => c.phone === b.phone) || {};
+  let bday = "";
+  if (b.couponBirthday) {
+    const input = prompt("請輸入證件上的生日（格式 2000-05-20）\n預約月份：" + date.slice(5, 7) + " 月", cust.birthday || "");
+    if (input === null) return;
+    bday = input.trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(bday)) { alert("生日格式不正確，請輸入像 2000-05-20 這樣的格式"); return; }
+    if (bday.slice(5, 7) !== date.slice(5, 7)) { alert("證件上的生日不在預約當月，無法折抵。若要取消優惠，請按「取消優惠」。"); return; }
+  } else if (!confirm("確認已核對，折抵 $" + b.couponAmount + "？")) return;
+  const original = b.originalPrice != null ? b.originalPrice : b.price;
+  const discount = Math.min(Number(b.couponAmount || 0), Number(original || 0));
+  const patch = { couponStatus: "redeemed", discount, originalPrice: original, price: original != null ? original - discount : null };
+  try {
+    await updateDoc(doc(db, "bookings", id), patch);
+    if (bday) {
+      await setDoc(doc(db, "customers", b.phone), { birthday: bday, birthdayLocked: true }, { merge: true });
+      S.directory = await loadDirectory();
+    }
+    S.bookingsCache[date] = list.map(x => x.id === id ? { ...x, ...patch } : x);
+  } catch (e) { console.error(e); alert("儲存失敗，請檢查網路後再試一次"); }
+  render();
+};
+window.adminVoidCoupon = async (id, date) => {
+  if (!confirm("確定取消這筆預約的優惠？")) return;
+  const list = S.bookingsCache[date] || [];
+  try {
+    await updateDoc(doc(db, "bookings", id), { couponStatus: "void" });
+    S.bookingsCache[date] = list.map(x => x.id === id ? { ...x, couponStatus: "void" } : x);
+  } catch (e) { console.error(e); alert("儲存失敗，請檢查網路後再試一次"); }
+  render();
+};
+function couponTipFlash(msg) {
+  S.admin.couponTip = msg; render();
+  setTimeout(() => { S.admin.couponTip = ""; render(); }, 3500);
+}
+window.adminAddCoupon = async () => {
+  const title = document.getElementById("cp-title").value.trim();
+  const code = document.getElementById("cp-code").value.trim().toUpperCase();
+  const kind = document.getElementById("cp-kind").value;
+  if (!title || !code) return couponTipFlash("請填寫名稱與優惠碼");
+  if (!/^[A-Z0-9_-]{2,20}$/.test(code)) return couponTipFlash("優惠碼請用英文或數字，2 到 20 個字");
+  if (S.coupons.some(c => String(c.code).toUpperCase() === code)) return couponTipFlash("這個優惠碼已經有了，請換一個");
+  const amounts = {};
+  S.durations.forEach(d => { const v = parseInt(document.getElementById("cp-amt-" + d.minutes)?.value, 10); if (v > 0) amounts[d.minutes] = v; });
+  if (!Object.keys(amounts).length) return couponTipFlash("請至少設定一個時長的折抵金額");
+  const c = {
+    id: "cp" + Date.now().toString(36), code, title, birthday: kind === "birthday", amounts,
+    validFrom: document.getElementById("cp-from").value || "", validTo: document.getElementById("cp-to").value || "",
+    maxTotal: parseInt(document.getElementById("cp-max").value, 10) || 0, active: true,
+  };
+  S.coupons.push(c);
+  const ok = await setConfig("coupons", { list: S.coupons });
+  if (!ok) { S.coupons.pop(); return couponTipFlash("儲存失敗，請檢查網路連線後再試一次"); }
+  couponTipFlash("已新增優惠券，按「複製連結文案」就能發給客人");
+};
+window.adminToggleCoupon = async (id) => {
+  const c = S.coupons.find(x => x.id === id);
+  if (!c) return;
+  c.active = !c.active;
+  const ok = await setConfig("coupons", { list: S.coupons });
+  if (!ok) { c.active = !c.active; return couponTipFlash("儲存失敗，請檢查網路連線後再試一次"); }
+  render();
+};
+window.adminDeleteCoupon = async (id) => {
+  const c = S.coupons.find(x => x.id === id);
+  if (!c || !confirm("確定刪除「" + c.title + "」？已預約的客人不受影響。")) return;
+  const backup = S.coupons;
+  S.coupons = S.coupons.filter(x => x.id !== id);
+  const ok = await setConfig("coupons", { list: S.coupons });
+  if (!ok) { S.coupons = backup; return couponTipFlash("刪除失敗，請檢查網路連線後再試一次"); }
+  render();
+};
+window.adminCopyCoupon = async (id) => {
+  const c = S.coupons.find(x => x.id === id);
+  if (!c) return;
+  const lines = ["🎁 " + c.title, couponAmountsText(c), c.birthday ? "（需填寫生日，限生日當月預約使用，到店出示證件核對後折抵）" : "（到店核對後折抵）"];
+  if (c.validFrom || c.validTo) lines.push("適用預約日期：" + (c.validFrom || "即日起") + " ~ " + (c.validTo || "不限"));
+  lines.push("預約連結：" + couponLink(c));
+  const text = lines.join("\n");
+  let ok = false;
+  try { await navigator.clipboard.writeText(text); ok = true; }
+  catch (e) {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select(); ok = document.execCommand("copy"); document.body.removeChild(ta);
+    } catch (e2) {}
+  }
+  if (!ok) { prompt("請長按全選後複製下面的文字", text); return; }
+  couponTipFlash("已複製，可以直接貼到官方 LINE 發送");
 };
 window.adminCancelBooking = async (id, date) => {
   const list = S.bookingsCache[date] || [];
